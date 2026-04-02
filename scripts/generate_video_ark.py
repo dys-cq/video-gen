@@ -38,6 +38,10 @@ class ConfigError(RuntimeError):
     pass
 
 
+class PollingError(RuntimeError):
+    pass
+
+
 def _normalize_non_empty(value: object) -> str:
     return value.strip() if isinstance(value, str) else ""
 
@@ -152,9 +156,17 @@ def _extract_error_message(payload: dict) -> str:
     return ""
 
 
-def _query_task(client: httpx.Client, query_url: str, headers: dict[str, str]) -> dict:
-    query_resp = client.get(query_url, headers=headers)
-    return _ensure_http_ok(query_resp, "Task query")
+def _query_task(base_url: str, headers: dict[str, str], task_id: str) -> dict:
+    query_url = f"{base_url}/contents/generations/tasks/{task_id}"
+    with httpx.Client(timeout=httpx.Timeout(60.0, connect=15.0)) as client:
+        query_resp = client.get(query_url, headers=headers)
+        return _ensure_http_ok(query_resp, "Task query")
+
+
+def _print_recovery_hint(task_id: str) -> None:
+    script_path = (SKILL_ROOT / "scripts" / "query_video_task_ark.py").resolve()
+    print("可补查任务状态：")
+    print(f'uv run python "{script_path}" {task_id}')
 
 
 def _maybe_download(video_url: str, auto_download: bool, download_output: Optional[str]) -> None:
@@ -176,6 +188,7 @@ def generate_video(
     max_polls: int = 120,
     auto_download: bool = False,
     download_output: Optional[str] = None,
+    max_query_failures: int = 6,
 ) -> None:
     base_url, api_key = _resolve_runtime()
     headers = _build_request_headers(api_key)
@@ -207,49 +220,70 @@ def generate_video(
         create_payload = _ensure_http_ok(create_resp, "Task submission")
         task_id = _extract_task_id(create_payload)
 
-        print(f"Task submitted, Task ID: {task_id}")
-        print(f"Create response: {json.dumps(create_payload, ensure_ascii=False)}")
-        print(f"Polling task status (every {poll_interval:g} seconds, max {max_polls} polls)...")
+    print(f"Task submitted, Task ID: {task_id}")
+    print(f"Create response: {json.dumps(create_payload, ensure_ascii=False)}")
+    print(f"Polling task status (every {poll_interval:g} seconds, max {max_polls} polls)...")
 
-        query_url = f"{base_url}/contents/generations/tasks/{task_id}"
-        for poll_index in range(1, max_polls + 1):
-            query_payload = _query_task(client, query_url, headers)
-            status = _extract_status(query_payload)
-            video_url = _extract_video_url(query_payload)
+    consecutive_query_failures = 0
+    last_query_error = ""
 
-            if video_url and (not status or status in TERMINAL_SUCCESS_STATUSES):
-                print(f"\nVideo generated successfully, download URL: {video_url}")
-                _maybe_download(video_url, auto_download, download_output)
-                return
-
-            if status in TERMINAL_SUCCESS_STATUSES:
-                print("\nTask reached success status.")
-                if video_url:
-                    print(f"Video generated successfully, download URL: {video_url}")
-                    _maybe_download(video_url, auto_download, download_output)
-                else:
-                    print("No direct video URL found in response. Full payload:")
-                    print(json.dumps(query_payload, ensure_ascii=False, indent=2))
-                return
-
-            if status in TERMINAL_FAILURE_STATUSES:
-                error_message = _extract_error_message(query_payload)
-                raise RuntimeError(
-                    f"Task failed with terminal status ({status})"
-                    + (f": {error_message}" if error_message else "")
-                    + f" | payload={json.dumps(query_payload, ensure_ascii=False)}"
-                )
-
+    for poll_index in range(1, max_polls + 1):
+        try:
+            query_payload = _query_task(base_url, headers, task_id)
+            consecutive_query_failures = 0
+            last_query_error = ""
+        except (RuntimeError, httpx.HTTPError) as exc:
+            consecutive_query_failures += 1
+            last_query_error = str(exc)
             print(
-                f"Task in progress (poll {poll_index}/{max_polls}, status={status or 'unknown'})...",
-                end="\r",
+                f"\nTask query warning ({consecutive_query_failures}/{max_query_failures}): {exc}",
                 flush=True,
             )
+            if consecutive_query_failures >= max_query_failures:
+                raise PollingError(
+                    f"任务已创建，但轮询连续失败 {consecutive_query_failures} 次。"
+                    f" Task ID: {task_id}. Last error: {last_query_error}"
+                ) from exc
             time.sleep(poll_interval)
+            continue
 
-        raise RuntimeError(
-            f"Polling timeout after {max_polls} polls. Last known task state kept on server."
+        status = _extract_status(query_payload)
+        video_url = _extract_video_url(query_payload)
+
+        if video_url and (not status or status in TERMINAL_SUCCESS_STATUSES):
+            print(f"\nVideo generated successfully, download URL: {video_url}")
+            _maybe_download(video_url, auto_download, download_output)
+            return
+
+        if status in TERMINAL_SUCCESS_STATUSES:
+            print("\nTask reached success status.")
+            if video_url:
+                print(f"Video generated successfully, download URL: {video_url}")
+                _maybe_download(video_url, auto_download, download_output)
+            else:
+                print("No direct video URL found in response. Full payload:")
+                print(json.dumps(query_payload, ensure_ascii=False, indent=2))
+            return
+
+        if status in TERMINAL_FAILURE_STATUSES:
+            error_message = _extract_error_message(query_payload)
+            raise RuntimeError(
+                f"Task failed with terminal status ({status})"
+                + (f": {error_message}" if error_message else "")
+                + f" | payload={json.dumps(query_payload, ensure_ascii=False)}"
+            )
+
+        print(
+            f"Task in progress (poll {poll_index}/{max_polls}, status={status or 'unknown'})...",
+            end="\r",
+            flush=True,
         )
+        time.sleep(poll_interval)
+
+    raise PollingError(
+        f"Polling timeout after {max_polls} polls. Task ID: {task_id}. "
+        "The task may still be running on the server."
+    )
 
 
 def main() -> int:
@@ -277,6 +311,12 @@ def main() -> int:
     )
     parser.add_argument("--dry-run", action="store_true", default=False, help="Print request payload only")
     parser.add_argument("--max-polls", type=int, default=120, help="Maximum number of polling attempts")
+    parser.add_argument(
+        "--max-query-failures",
+        type=int,
+        default=6,
+        help="Maximum consecutive query failures before aborting",
+    )
     parser.add_argument("--auto-download", action="store_true", default=False, help="Download the video automatically when ready")
     parser.add_argument("--download-output", type=str, default=None, help="Optional output path for auto-downloaded video")
     args = parser.parse_args()
@@ -290,6 +330,8 @@ def main() -> int:
         raise ConfigError("--duration must be greater than 0")
     if args.max_polls <= 0:
         raise ConfigError("--max-polls must be greater than 0")
+    if args.max_query_failures <= 0:
+        raise ConfigError("--max-query-failures must be greater than 0")
 
     try:
         generate_video(
@@ -304,7 +346,16 @@ def main() -> int:
             max_polls=args.max_polls,
             auto_download=args.auto_download,
             download_output=args.download_output,
+            max_query_failures=args.max_query_failures,
         )
+    except PollingError as exc:
+        message = str(exc)
+        print(f"Execution failed: {message}")
+        if "Task ID:" in message:
+            task_id = message.split("Task ID:", 1)[1].split(".", 1)[0].strip()
+            if task_id:
+                _print_recovery_hint(task_id)
+        return 1
     except (ConfigError, RuntimeError, httpx.HTTPError, ImageAdapterError) as exc:
         print(f"Execution failed: {exc}")
         return 1

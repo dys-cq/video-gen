@@ -129,6 +129,16 @@ uv run python scripts/generate_video_ark.py \
   --download-output "C:\\path\\to\\output.mp4"
 ```
 
+### 控制轮询容错
+
+```bash
+uv run python scripts/generate_video_ark.py \
+  --prompt "a dragon emerges from a sketchbook" \
+  --duration 5 \
+  --max-polls 120 \
+  --max-query-failures 6
+```
+
 ### 按任务 ID 补查状态
 
 ```bash
@@ -144,6 +154,7 @@ uv run python scripts/query_video_task_ark.py cgt-xxxxxxxxxxxxxxxx
 3. `image_url_adapter.py` 按 `.env` 或 `--upload-provider` 选择 provider
 4. 当前支持：`kieai` / `catbox` / `none`
 5. 任务成功后如果开启 `--auto-download`，会自动调用 `download_video.py` 的下载逻辑
+6. 如果轮询阶段发生短暂查询异常，会自动重试；只有连续失败超过 `--max-query-failures` 才会退出，并打印任务补查命令
 
 ---
 
