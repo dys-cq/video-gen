@@ -9,6 +9,9 @@
   - 直连火山引擎 Ark / Seedance 官方接口
   - 使用 `ARK_API_KEY`
   - 本地图片通过独立适配层转成公网 URL
+- **任务查询工具**：`scripts/query_video_task_ark.py`
+  - 使用任务 ID 单独查询任务状态
+  - 适合排查轮询问题或补查最终结果
 
 ---
 
@@ -86,6 +89,22 @@ uv run python scripts/generate_video_ark.py \
   --prompt "smooth 360 degree product rotation, rim light, dark premium background" \
   --image "C:\\path\\to\\product.png" \
   --duration 5
+```
+
+### 只预览 payload（不提交任务）
+
+```bash
+uv run python scripts/generate_video_ark.py \
+  --prompt "a dragon emerges from a sketchbook" \
+  --image "C:\\path\\to\\dragon.png" \
+  --duration 5 \
+  --dry-run
+```
+
+### 按任务 ID 补查状态
+
+```bash
+uv run python scripts/query_video_task_ark.py cgt-xxxxxxxxxxxxxxxx
 ```
 
 逻辑：

@@ -29,6 +29,9 @@ SUPPORTED_MODELS = (
     "doubao-seedance-1-5-pro-251215",
     "doubao-seedance-1-0-pro-fast-251015",
 )
+TERMINAL_SUCCESS_STATUSES = {"succeeded", "success", "completed"}
+TERMINAL_FAILURE_STATUSES = {"failed", "cancelled", "expired", "canceled"}
+RUNNING_STATUSES = {"queued", "pending", "running", "processing", "submitted", "in_progress"}
 
 
 class ConfigError(RuntimeError):
@@ -59,18 +62,11 @@ def _build_request_headers(api_key: str) -> dict[str, str]:
 
 
 def _build_content(prompt: str, image_input: Optional[str], upload_provider: Optional[str]) -> list[dict]:
-    content: list[dict] = [
-        {"type": "text", "text": prompt}
-    ]
-
+    content: list[dict] = [{"type": "text", "text": prompt}]
     normalized_image = _normalize_non_empty(image_input)
     if normalized_image:
         image_url = resolve_image_to_public_url(normalized_image, provider=upload_provider)
-        content.append({
-            "type": "image_url",
-            "image_url": {"url": image_url},
-        })
-
+        content.append({"type": "image_url", "image_url": {"url": image_url}})
     return content
 
 
@@ -108,24 +104,57 @@ def _extract_status(payload: dict) -> str:
         value = payload.get(key)
         if isinstance(value, str) and value.strip():
             return value.strip().lower()
+    data = payload.get("data")
+    if isinstance(data, dict):
+        for key in ("status", "task_status"):
+            value = data.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip().lower()
     return ""
 
 
 def _extract_video_url(payload: dict) -> str:
     possible_containers = [payload]
-    content = payload.get("content")
-    data = payload.get("data")
-    if isinstance(content, dict):
-        possible_containers.append(content)
-    if isinstance(data, dict):
-        possible_containers.append(data)
+    for key in ("content", "data", "result", "output"):
+        value = payload.get(key)
+        if isinstance(value, dict):
+            possible_containers.append(value)
+        elif isinstance(value, list):
+            for item in value:
+                if isinstance(item, dict):
+                    possible_containers.append(item)
 
     for container in possible_containers:
-        for key in ("video_url", "file_url", "url", "download_url"):
+        for key in ("video_url", "file_url", "url", "download_url", "videoUrl", "fileUrl"):
             value = container.get(key)
             if isinstance(value, str) and value.strip():
                 return value.strip()
+        media = container.get("media")
+        if isinstance(media, dict):
+            for key in ("video_url", "file_url", "url", "download_url"):
+                value = media.get(key)
+                if isinstance(value, str) and value.strip():
+                    return value.strip()
     return ""
+
+
+def _extract_error_message(payload: dict) -> str:
+    for key in ("message", "error", "error_message", "detail"):
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    data = payload.get("data")
+    if isinstance(data, dict):
+        for key in ("message", "error", "error_message", "detail"):
+            value = data.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    return ""
+
+
+def _query_task(client: httpx.Client, query_url: str, headers: dict[str, str]) -> dict:
+    query_resp = client.get(query_url, headers=headers)
+    return _ensure_http_ok(query_resp, "Task query")
 
 
 def generate_video(
@@ -136,6 +165,8 @@ def generate_video(
     duration: Optional[int] = None,
     generate_audio: bool = False,
     upload_provider: Optional[str] = None,
+    dry_run: bool = False,
+    max_polls: int = 120,
 ) -> None:
     base_url, api_key = _resolve_runtime()
     headers = _build_request_headers(api_key)
@@ -155,7 +186,12 @@ def generate_video(
     print(f"API Base URL: {base_url}")
     print(f"Create endpoint: {create_url}")
     print(f"Model: {model_id}")
-    print(f"Audio: {'enabled' if generate_audio else 'disabled (default)'}")
+    print(f"Audio: {'enabled' if generate_audio else 'disabled (request-side)'}")
+
+    if dry_run:
+        print("----- Dry Run Payload -----")
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return
 
     with httpx.Client(timeout=httpx.Timeout(120.0, connect=15.0)) as client:
         create_resp = client.post(create_url, headers=headers, json=payload)
@@ -163,31 +199,46 @@ def generate_video(
         task_id = _extract_task_id(create_payload)
 
         print(f"Task submitted, Task ID: {task_id}")
-        print(f"Polling task status (every {poll_interval:g} seconds)...")
+        print(f"Create response: {json.dumps(create_payload, ensure_ascii=False)}")
+        print(f"Polling task status (every {poll_interval:g} seconds, max {max_polls} polls)...")
 
         query_url = f"{base_url}/contents/generations/tasks/{task_id}"
-        while True:
-            query_resp = client.get(query_url, headers=headers)
-            query_payload = _ensure_http_ok(query_resp, "Task query")
+        for poll_index in range(1, max_polls + 1):
+            query_payload = _query_task(client, query_url, headers)
             status = _extract_status(query_payload)
+            video_url = _extract_video_url(query_payload)
 
-            if status == "succeeded":
-                video_url = _extract_video_url(query_payload)
+            if video_url and status in ("", *TERMINAL_SUCCESS_STATUSES):
+                print(f"\nVideo generated successfully, download URL: {video_url}")
+                return
+
+            if status in TERMINAL_SUCCESS_STATUSES:
+                print("\nTask reached success status.")
                 if video_url:
-                    print(f"\nVideo generated successfully, download URL: {video_url}")
+                    print(f"Video generated successfully, download URL: {video_url}")
                 else:
-                    print("\nVideo generated successfully, but no direct video URL was found.")
+                    print("No direct video URL found in response. Full payload:")
                     print(json.dumps(query_payload, ensure_ascii=False, indent=2))
                 return
 
-            if status in {"failed", "cancelled", "expired"}:
+            if status in TERMINAL_FAILURE_STATUSES:
+                error_message = _extract_error_message(query_payload)
                 raise RuntimeError(
-                    f"Task failed with terminal status ({status}): "
-                    f"{json.dumps(query_payload, ensure_ascii=False)}"
+                    f"Task failed with terminal status ({status})"
+                    + (f": {error_message}" if error_message else "")
+                    + f" | payload={json.dumps(query_payload, ensure_ascii=False)}"
                 )
 
-            print(f"Task in progress (status={status or 'unknown'})...", end="\r", flush=True)
+            print(
+                f"Task in progress (poll {poll_index}/{max_polls}, status={status or 'unknown'})...",
+                end="\r",
+                flush=True,
+            )
             time.sleep(poll_interval)
+
+        raise RuntimeError(
+            f"Polling timeout after {max_polls} polls. Last known task state kept on server."
+        )
 
 
 def main() -> int:
@@ -213,6 +264,8 @@ def main() -> int:
         "--upload-provider", default=None,
         help="Upload provider for local image paths: kieai|none (default from .env)",
     )
+    parser.add_argument("--dry-run", action="store_true", default=False, help="Print request payload only")
+    parser.add_argument("--max-polls", type=int, default=120, help="Maximum number of polling attempts")
     args = parser.parse_args()
 
     prompt = args.prompt.strip()
@@ -222,6 +275,8 @@ def main() -> int:
         raise ConfigError("--poll-interval must be greater than 0")
     if args.duration is not None and args.duration <= 0:
         raise ConfigError("--duration must be greater than 0")
+    if args.max_polls <= 0:
+        raise ConfigError("--max-polls must be greater than 0")
 
     try:
         generate_video(
@@ -232,6 +287,8 @@ def main() -> int:
             duration=args.duration,
             generate_audio=args.audio,
             upload_provider=args.upload_provider,
+            dry_run=args.dry_run,
+            max_polls=args.max_polls,
         )
     except (ConfigError, RuntimeError, httpx.HTTPError, ImageAdapterError) as exc:
         print(f"Execution failed: {exc}")
