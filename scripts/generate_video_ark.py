@@ -18,6 +18,7 @@ from typing import Optional
 import httpx
 from dotenv import load_dotenv
 
+from download_video import download_video
 from image_url_adapter import ImageAdapterError, resolve_image_to_public_url
 
 SKILL_ROOT = Path(__file__).resolve().parent.parent
@@ -31,7 +32,6 @@ SUPPORTED_MODELS = (
 )
 TERMINAL_SUCCESS_STATUSES = {"succeeded", "success", "completed"}
 TERMINAL_FAILURE_STATUSES = {"failed", "cancelled", "expired", "canceled"}
-RUNNING_STATUSES = {"queued", "pending", "running", "processing", "submitted", "in_progress"}
 
 
 class ConfigError(RuntimeError):
@@ -157,6 +157,13 @@ def _query_task(client: httpx.Client, query_url: str, headers: dict[str, str]) -
     return _ensure_http_ok(query_resp, "Task query")
 
 
+def _maybe_download(video_url: str, auto_download: bool, download_output: Optional[str]) -> None:
+    if not auto_download:
+        return
+    save_path = download_video(video_url, download_output)
+    print(f"Auto-downloaded video to: {save_path}")
+
+
 def generate_video(
     prompt: str,
     image_input: Optional[str] = None,
@@ -167,6 +174,8 @@ def generate_video(
     upload_provider: Optional[str] = None,
     dry_run: bool = False,
     max_polls: int = 120,
+    auto_download: bool = False,
+    download_output: Optional[str] = None,
 ) -> None:
     base_url, api_key = _resolve_runtime()
     headers = _build_request_headers(api_key)
@@ -208,14 +217,16 @@ def generate_video(
             status = _extract_status(query_payload)
             video_url = _extract_video_url(query_payload)
 
-            if video_url and status in ("", *TERMINAL_SUCCESS_STATUSES):
+            if video_url and (not status or status in TERMINAL_SUCCESS_STATUSES):
                 print(f"\nVideo generated successfully, download URL: {video_url}")
+                _maybe_download(video_url, auto_download, download_output)
                 return
 
             if status in TERMINAL_SUCCESS_STATUSES:
                 print("\nTask reached success status.")
                 if video_url:
                     print(f"Video generated successfully, download URL: {video_url}")
+                    _maybe_download(video_url, auto_download, download_output)
                 else:
                     print("No direct video URL found in response. Full payload:")
                     print(json.dumps(query_payload, ensure_ascii=False, indent=2))
@@ -262,10 +273,12 @@ def main() -> int:
     parser.add_argument("--audio", action="store_true", default=False, help="Generate video with audio")
     parser.add_argument(
         "--upload-provider", default=None,
-        help="Upload provider for local image paths: kieai|none (default from .env)",
+        help="Upload provider for local image paths: kieai|catbox|none (default from .env)",
     )
     parser.add_argument("--dry-run", action="store_true", default=False, help="Print request payload only")
     parser.add_argument("--max-polls", type=int, default=120, help="Maximum number of polling attempts")
+    parser.add_argument("--auto-download", action="store_true", default=False, help="Download the video automatically when ready")
+    parser.add_argument("--download-output", type=str, default=None, help="Optional output path for auto-downloaded video")
     args = parser.parse_args()
 
     prompt = args.prompt.strip()
@@ -289,6 +302,8 @@ def main() -> int:
             upload_provider=args.upload_provider,
             dry_run=args.dry_run,
             max_polls=args.max_polls,
+            auto_download=args.auto_download,
+            download_output=args.download_output,
         )
     except (ConfigError, RuntimeError, httpx.HTTPError, ImageAdapterError) as exc:
         print(f"Execution failed: {exc}")

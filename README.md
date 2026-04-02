@@ -1,6 +1,6 @@
 # video-gen
 
-视频生成 skill，现已拆分为两条执行链：
+视频生成 skill，现已拆分为三块：
 
 - **短期兼容链**：`scripts/generate_video_easyclaw.py`
   - 保留原有 EasyClaw 网关逻辑
@@ -8,7 +8,8 @@
 - **官方直连链**：`scripts/generate_video_ark.py`
   - 直连火山引擎 Ark / Seedance 官方接口
   - 使用 `ARK_API_KEY`
-  - 本地图片通过独立适配层转成公网 URL
+  - 支持本地图片自动上传为公网 URL
+  - 支持生成成功后自动下载视频
 - **任务查询工具**：`scripts/query_video_task_ark.py`
   - 使用任务 ID 单独查询任务状态
   - 适合排查轮询问题或补查最终结果
@@ -24,9 +25,10 @@ video-gen/
 ├─ README.md
 └─ scripts/
    ├─ download_video.py
-   ├─ generate_video.py              # 当前旧版入口（EasyClaw）
+   ├─ generate_video.py              # 旧版入口（EasyClaw）
    ├─ generate_video_easyclaw.py     # 兼容保留版
    ├─ generate_video_ark.py          # 官方 Ark 直连版
+   ├─ query_video_task_ark.py        # Ark 任务查询脚本
    └─ image_url_adapter.py           # 本地图 -> 公网 URL 适配层
 ```
 
@@ -45,25 +47,29 @@ video-gen/
 ARK_API_KEY=your_ark_api_key
 ARK_BASE_URL=https://ark.cn-beijing.volces.com/api/v3
 
-# 本地图上传适配（短期默认使用 KieAI）
+# 本地图上传适配
 KIEAI_API_KEY=your_kieai_api_key
 KIEAI_BASE_URL=https://kieai.redpandaai.co
-IMAGE_UPLOAD_PROVIDER=kieai
+IMAGE_UPLOAD_PROVIDER=catbox
 IMAGE_UPLOAD_PATH=images/video-gen
+IMAGE_UPLOAD_MAX_MB=20
 ```
 
 说明：
 
 - `ARK_API_KEY`：官方直连必填
 - `ARK_BASE_URL`：可不填，默认官方北京区 v3 地址
-- `KIEAI_API_KEY`：仅当你要把**本地图片路径**自动转成公网 URL 时才需要
+- `KIEAI_API_KEY`：仅当 provider 为 `kieai` 时才需要
 - `IMAGE_UPLOAD_PROVIDER`：
-  - `kieai`：允许自动上传本地图
+  - `kieai`：允许自动上传本地图（需 KIEAI_API_KEY）
+  - `catbox`：允许自动上传本地图（免费、无需 API key）
   - `none`：禁止上传，本地路径将直接报错，只接受公网 URL
+- `IMAGE_UPLOAD_PATH`：KieAI 上传路径
+- `IMAGE_UPLOAD_MAX_MB`：本地图片上传大小限制，默认 20MB
 
 ---
 
-## 短期方案：先跑通官方直连
+## 典型用法
 
 ### 文生视频
 
@@ -91,6 +97,16 @@ uv run python scripts/generate_video_ark.py \
   --duration 5
 ```
 
+### 指定使用 catbox 上传本地图
+
+```bash
+uv run python scripts/generate_video_ark.py \
+  --prompt "ink dragon emerges from a drawing" \
+  --image "C:\\path\\to\\dragon.png" \
+  --upload-provider catbox \
+  --duration 5
+```
+
 ### 只预览 payload（不提交任务）
 
 ```bash
@@ -101,18 +117,33 @@ uv run python scripts/generate_video_ark.py \
   --dry-run
 ```
 
+### 生成成功后自动下载视频
+
+```bash
+uv run python scripts/generate_video_ark.py \
+  --prompt "a dragon emerges from a sketchbook" \
+  --image "C:\\path\\to\\dragon.png" \
+  --upload-provider catbox \
+  --duration 5 \
+  --auto-download \
+  --download-output "C:\\path\\to\\output.mp4"
+```
+
 ### 按任务 ID 补查状态
 
 ```bash
 uv run python scripts/query_video_task_ark.py cgt-xxxxxxxxxxxxxxxx
 ```
 
-逻辑：
+---
+
+## 当前逻辑
 
 1. 如果 `--image` 是 `http/https URL`，直接传给 Ark
 2. 如果 `--image` 是本地路径，则交给 `image_url_adapter.py`
-3. `image_url_adapter.py` 按 `.env` 中的 `IMAGE_UPLOAD_PROVIDER` 处理
-4. 当前默认 provider 为 `kieai`
+3. `image_url_adapter.py` 按 `.env` 或 `--upload-provider` 选择 provider
+4. 当前支持：`kieai` / `catbox` / `none`
+5. 任务成功后如果开启 `--auto-download`，会自动调用 `download_video.py` 的下载逻辑
 
 ---
 
@@ -124,12 +155,9 @@ uv run python scripts/query_video_task_ark.py cgt-xxxxxxxxxxxxxxxx
 
 下一步建议：
 
-1. 新增更多 provider（如 catbox / 自建 OSS / S3 / R2）
-2. 给 adapter 增加：
-   - 文件大小限制
-   - 允许格式白名单
-   - 更严格的返回结构校验
-3. 将 `generate_video_ark.py` 保持为“只关心模型调用，不关心上传细节”
+1. 新增更多 provider（如自建 OSS / S3 / R2）
+2. 补充更严格的 MIME / 格式 / 文件大小校验
+3. 继续保持 `generate_video_ark.py` 只关心模型调用，不关心上传细节
 
 ---
 
@@ -140,31 +168,21 @@ uv run python scripts/query_video_task_ark.py cgt-xxxxxxxxxxxxxxxx
 1. 本地图先上传到你自己的稳定对象存储
 2. 再把稳定 URL 提供给 Ark
 3. 上传层和模型层彻底解耦
-4. `generate_video.py` 最终可以变成统一入口，内部按 provider 分发
+4. `generate_video.py` 最终变成统一入口，内部按 provider 分发
 
 长期目标不是“隐藏 uid/token”，而是：
 
 - 不再读取 `.easyclaw` 身份文件
-- 不再发 `X-AUTH-UID` / `X-AUTH-TOKEN`
+- 不再发送 `X-AUTH-UID` / `X-AUTH-TOKEN`
 - 不再依赖 `aibot-srv.easyclaw.cn`
 - 不再依赖 EasyClaw 的 payload 兼容行为
 - 只保留：官方模型 + 官方 endpoint + Bearer Key
 
 ---
 
-## 下载视频
-
-两条链都可复用：
-
-```bash
-uv run python scripts/download_video.py "<video_url>" -o "C:\\path\\to\\output.mp4"
-```
-
----
-
 ## 注意事项
 
-1. `generate_video_easyclaw.py` 是保留兼容，不是未来主线
-2. `generate_video_ark.py` 才是你现在要逐步迁移到的主线
-3. 如果 Ark 官方后续对 `generate_audio`、图片格式、返回结构有变化，以官方接口文档为准
-4. 当前 `.env` 中有真实 key，建议后续避免在对话、日志、README 中直接暴露
+1. `generate_video_easyclaw.py` 是兼容保留，不是未来主线
+2. `generate_video_ark.py` 才是当前主线
+3. Catbox 适合测试和轻量桥接，不适合作长期正式素材库
+4. 当前 `.env` 中有真实 key，不要提交到 GitHub

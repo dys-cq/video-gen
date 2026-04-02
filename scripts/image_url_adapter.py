@@ -8,6 +8,7 @@ Purpose:
 
 Current providers:
 - kieai: upload local image bytes as base64 to KieAI temporary file hosting
+- catbox: upload local file directly to Catbox, no API key required
 - none: reject local files; only allow http(s) URLs
 """
 from __future__ import annotations
@@ -29,6 +30,11 @@ KIEAI_BASE_URL = os.getenv("KIEAI_BASE_URL", "https://kieai.redpandaai.co").rstr
 KIEAI_API_KEY = (os.getenv("KIEAI_API_KEY") or "").strip()
 DEFAULT_UPLOAD_PROVIDER = (os.getenv("IMAGE_UPLOAD_PROVIDER") or "kieai").strip().lower()
 DEFAULT_UPLOAD_PATH = (os.getenv("IMAGE_UPLOAD_PATH") or "images/video-gen").strip()
+CATBOX_UPLOAD_URL = "https://catbox.moe/user/api.php"
+MAX_FILE_SIZE_MB = int((os.getenv("IMAGE_UPLOAD_MAX_MB") or "20").strip())
+ALLOWED_EXTENSIONS = {
+    ".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp"
+}
 
 
 class ImageAdapterError(RuntimeError):
@@ -42,6 +48,21 @@ def _normalize_non_empty(value: object) -> str:
 def _guess_mime_type(file_path: Path) -> str:
     guessed, _ = mimetypes.guess_type(str(file_path))
     return guessed or "application/octet-stream"
+
+
+def _validate_local_file(file_path: Path) -> None:
+    if not file_path.is_file():
+        raise ImageAdapterError("本地图片路径无效或文件不存在")
+    suffix = file_path.suffix.lower()
+    if suffix not in ALLOWED_EXTENSIONS:
+        raise ImageAdapterError(
+            f"不支持的图片格式: {suffix}，允许格式: {', '.join(sorted(ALLOWED_EXTENSIONS))}"
+        )
+    size_mb = file_path.stat().st_size / (1024 * 1024)
+    if size_mb > MAX_FILE_SIZE_MB:
+        raise ImageAdapterError(
+            f"图片过大: {size_mb:.2f}MB，超过限制 {MAX_FILE_SIZE_MB}MB"
+        )
 
 
 def _to_data_url(file_path: Path) -> tuple[str, str]:
@@ -82,6 +103,27 @@ def upload_to_kieai_base64(base64_data: str, file_name: str, upload_path: str = 
     return result
 
 
+def upload_to_catbox(file_path: Path) -> str:
+    try:
+        with file_path.open("rb") as f:
+            response = requests.post(
+                CATBOX_UPLOAD_URL,
+                data={"reqtype": "fileupload"},
+                files={"fileToUpload": (file_path.name, f, _guess_mime_type(file_path))},
+                timeout=120,
+            )
+        response.raise_for_status()
+    except requests.RequestException as exc:
+        raise ImageAdapterError(f"Catbox 上传失败: {exc}") from exc
+
+    text = response.text.strip()
+    if not text:
+        raise ImageAdapterError("Catbox 返回空响应")
+    if not (text.startswith("http://") or text.startswith("https://")):
+        raise ImageAdapterError(f"Catbox 返回异常: {text}")
+    return text
+
+
 def get_file_url(upload_result: dict) -> str:
     data = upload_result.get("data") if isinstance(upload_result, dict) else None
     if not isinstance(data, dict):
@@ -110,30 +152,30 @@ def resolve_image_to_public_url(image_input: Optional[str], provider: Optional[s
 
     chosen_provider = (provider or DEFAULT_UPLOAD_PROVIDER or "kieai").strip().lower()
     file_path = Path(normalized).expanduser()
-    if not file_path.is_file():
-        raise ImageAdapterError(
-            "图片输入既不是 http(s) URL，也不是有效本地文件路径"
-        )
+    _validate_local_file(file_path)
 
     if chosen_provider == "none":
         raise ImageAdapterError("当前配置禁止自动上传本地图片，请改用公网 URL")
 
-    if chosen_provider != "kieai":
-        raise ImageAdapterError(f"暂不支持的 IMAGE_UPLOAD_PROVIDER: {chosen_provider}")
+    if chosen_provider == "kieai":
+        data_url, _mime_type = _to_data_url(file_path)
+        upload_result = upload_to_kieai_base64(
+            base64_data=data_url,
+            file_name=file_path.name,
+            upload_path=DEFAULT_UPLOAD_PATH,
+        )
+        return get_file_url(upload_result)
 
-    data_url, _mime_type = _to_data_url(file_path)
-    upload_result = upload_to_kieai_base64(
-        base64_data=data_url,
-        file_name=file_path.name,
-        upload_path=DEFAULT_UPLOAD_PATH,
-    )
-    return get_file_url(upload_result)
+    if chosen_provider == "catbox":
+        return upload_to_catbox(file_path)
+
+    raise ImageAdapterError(f"暂不支持的 IMAGE_UPLOAD_PROVIDER: {chosen_provider}")
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Resolve a local image path into a public URL")
     parser.add_argument("image", help="local image path or http(s) URL")
-    parser.add_argument("--provider", default=None, help="upload provider: kieai|none")
+    parser.add_argument("--provider", default=None, help="upload provider: kieai|catbox|none")
     args = parser.parse_args()
 
     try:
