@@ -10,6 +10,7 @@
   - 使用 `ARK_API_KEY`
   - 支持本地图片自动上传为公网 URL
   - 支持生成成功后自动下载视频
+  - 支持可选 JSON 结果输出
 - **任务查询工具**：`scripts/query_video_task_ark.py`
   - 使用任务 ID 单独查询任务状态
   - 适合排查轮询问题或补查最终结果
@@ -66,6 +67,31 @@ IMAGE_UPLOAD_MAX_MB=20
   - `none`：禁止上传，本地路径将直接报错，只接受公网 URL
 - `IMAGE_UPLOAD_PATH`：KieAI 上传路径
 - `IMAGE_UPLOAD_MAX_MB`：本地图片上传大小限制，默认 20MB
+
+---
+
+## 当前已验证状态
+
+截至当前版本，以下官方链路已经完成真实回归验证：
+
+**本地图片 → Catbox 上传 → Ark 官方接口 → Seedance 生成 → 自动下载 mp4 → 脚本正常 exit 0**
+
+已验证样例：
+
+- Task ID：`cgt-20260402194840-lnd4n`
+- 模型：`doubao-seedance-1-5-pro-251215`
+- 时长：`12s`
+- 自动下载输出：
+  - `C:\Users\Administrator\.openclaw\workspace\output\dragon-video-12s-rerun.mp4`
+- 结果：
+  - `generate_video_ark.py --auto-download` 单脚本闭环成功
+  - 不再需要依赖“任务成功后手动补查再单独下载”的补救流程
+
+补充说明：
+
+- 早期版本曾出现“任务已成功但轮询阶段提前退出 code 1”的问题
+- 当前版本已增加轮询容错与补查提示
+- `query_video_task_ark.py` 仍保留，作为排障兜底工具
 
 ---
 
@@ -129,6 +155,32 @@ uv run python scripts/generate_video_ark.py \
   --download-output "C:\\path\\to\\output.mp4"
 ```
 
+### 输出最终成功结果为 JSON
+
+```bash
+uv run python scripts/generate_video_ark.py \
+  --prompt "a dragon emerges from a sketchbook" \
+  --image "C:\\path\\to\\dragon.png" \
+  --duration 5 \
+  --auto-download \
+  --download-output "C:\\path\\to\\output.mp4" \
+  --json
+```
+
+成功时会额外输出类似结果：
+
+```json
+{
+  "task_id": "cgt-xxxxxxxxxxxxxxxx",
+  "status": "succeeded",
+  "model": "doubao-seedance-1-5-pro-251215",
+  "duration": 5,
+  "video_url": "https://...mp4",
+  "local_path": "C:\\path\\to\\output.mp4",
+  "query_payload": {"...": "..."}
+}
+```
+
 ### 控制轮询容错
 
 ```bash
@@ -155,6 +207,7 @@ uv run python scripts/query_video_task_ark.py cgt-xxxxxxxxxxxxxxxx
 4. 当前支持：`kieai` / `catbox` / `none`
 5. 任务成功后如果开启 `--auto-download`，会自动调用 `download_video.py` 的下载逻辑
 6. 如果轮询阶段发生短暂查询异常，会自动重试；只有连续失败超过 `--max-query-failures` 才会退出，并打印任务补查命令
+7. 如果传入 `--json`，成功完成后会额外打印结构化结果，方便其他脚本或 skill 继续消费
 
 ---
 

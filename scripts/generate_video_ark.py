@@ -169,11 +169,35 @@ def _print_recovery_hint(task_id: str) -> None:
     print(f'uv run python "{script_path}" {task_id}')
 
 
-def _maybe_download(video_url: str, auto_download: bool, download_output: Optional[str]) -> None:
+def _maybe_download(video_url: str, auto_download: bool, download_output: Optional[str]) -> Optional[Path]:
     if not auto_download:
-        return
+        return None
     save_path = download_video(video_url, download_output)
     print(f"Auto-downloaded video to: {save_path}")
+    return save_path
+
+
+def _build_result(
+    *,
+    task_id: str,
+    status: str,
+    video_url: str = "",
+    local_path: Optional[Path] = None,
+    model: str,
+    duration: Optional[int],
+    query_payload: Optional[dict] = None,
+) -> dict:
+    result: dict = {
+        "task_id": task_id,
+        "status": status,
+        "model": model,
+        "duration": duration,
+        "video_url": video_url or None,
+        "local_path": str(local_path) if local_path else None,
+    }
+    if query_payload is not None:
+        result["query_payload"] = query_payload
+    return result
 
 
 def generate_video(
@@ -189,7 +213,7 @@ def generate_video(
     auto_download: bool = False,
     download_output: Optional[str] = None,
     max_query_failures: int = 6,
-) -> None:
+) -> Optional[dict]:
     base_url, api_key = _resolve_runtime()
     headers = _build_request_headers(api_key)
 
@@ -213,7 +237,7 @@ def generate_video(
     if dry_run:
         print("----- Dry Run Payload -----")
         print(json.dumps(payload, ensure_ascii=False, indent=2))
-        return
+        return None
 
     with httpx.Client(timeout=httpx.Timeout(120.0, connect=15.0)) as client:
         create_resp = client.post(create_url, headers=headers, json=payload)
@@ -252,18 +276,35 @@ def generate_video(
 
         if video_url and (not status or status in TERMINAL_SUCCESS_STATUSES):
             print(f"\nVideo generated successfully, download URL: {video_url}")
-            _maybe_download(video_url, auto_download, download_output)
-            return
+            local_path = _maybe_download(video_url, auto_download, download_output)
+            return _build_result(
+                task_id=task_id,
+                status=status or "succeeded",
+                video_url=video_url,
+                local_path=local_path,
+                model=model_id,
+                duration=duration,
+                query_payload=query_payload,
+            )
 
         if status in TERMINAL_SUCCESS_STATUSES:
             print("\nTask reached success status.")
+            local_path: Optional[Path] = None
             if video_url:
                 print(f"Video generated successfully, download URL: {video_url}")
-                _maybe_download(video_url, auto_download, download_output)
+                local_path = _maybe_download(video_url, auto_download, download_output)
             else:
                 print("No direct video URL found in response. Full payload:")
                 print(json.dumps(query_payload, ensure_ascii=False, indent=2))
-            return
+            return _build_result(
+                task_id=task_id,
+                status=status,
+                video_url=video_url,
+                local_path=local_path,
+                model=model_id,
+                duration=duration,
+                query_payload=query_payload,
+            )
 
         if status in TERMINAL_FAILURE_STATUSES:
             error_message = _extract_error_message(query_payload)
@@ -319,6 +360,12 @@ def main() -> int:
     )
     parser.add_argument("--auto-download", action="store_true", default=False, help="Download the video automatically when ready")
     parser.add_argument("--download-output", type=str, default=None, help="Optional output path for auto-downloaded video")
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        default=False,
+        help="Print final success result as JSON after completion",
+    )
     args = parser.parse_args()
 
     prompt = args.prompt.strip()
@@ -334,7 +381,7 @@ def main() -> int:
         raise ConfigError("--max-query-failures must be greater than 0")
 
     try:
-        generate_video(
+        result = generate_video(
             prompt=prompt,
             image_input=args.image_input,
             model_id=args.model,
@@ -348,6 +395,8 @@ def main() -> int:
             download_output=args.download_output,
             max_query_failures=args.max_query_failures,
         )
+        if args.json and result is not None:
+            print(json.dumps(result, ensure_ascii=False, indent=2))
     except PollingError as exc:
         message = str(exc)
         print(f"Execution failed: {message}")
